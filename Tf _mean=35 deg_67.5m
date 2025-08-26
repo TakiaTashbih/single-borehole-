@@ -1,0 +1,168 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pygfunction as gt
+
+# =========================
+# Fixed inputs (edit as needed)
+# =========================
+# Ground / geometry
+D     = 4.0              # burial depth [m]
+r_b   = 0.2032/2 #0.1524 / 2       # borehole radius [m]
+alpha = 1.0e-6           # ground thermal diffusivity [m2/s]
+k_s   = 2.45             # ground thermal conductivity [W/m·K]
+T_g   = 25.0             # undisturbed ground temp [°C]
+
+# Pipe & grout
+r_out   = 0.032 / 2      # pipe outer radius [m]
+r_in    = 0.027 / 2      # pipe inner radius [m]
+D_s     = 0.08           # intended *center-to-center* shank spacing [m]
+epsilon = 1e-6           # pipe roughness [m]
+k_g     = 2.98           # grout [W/m·K]
+k_p     = 0.7           # pipe  [W/m·K]
+# Place legs at ± D_s/2 (so center-to-center spacing = D_s)
+pos_single = [(-D_s, 0.0), (D_s, 0.0)]
+# Fluid & load (cooling → heat injected to ground)
+m_flow = 0.30                                   # mass flow [kg/s]
+fluid  = gt.media.Fluid('Water', 20.0)          # or 'MPG20' if glycol
+cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+TON = 0.75
+Q_reject_W = -1000.0 * 3.517 * TON              # negative = injection (cooling)
+
+# Time grid (30 days, hourly)
+dt   = 3600.0
+tmax = 30 * 24 * 3600.0
+Nt   = int(np.ceil(tmax / dt))
+time = dt * np.arange(1, Nt+1)
+hours = time / 3600.0
+
+# g-function options
+options = {'nSegments': 8, 'disp': False}
+method  = 'similarities'   # pygfunction >= 2.3
+
+# Design cap for MEAN fluid temperature
+T_mean_cap = 35.0  # °C
+
+
+# =========================
+# Precompute pipe-side terms once
+# =========================
+R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+    m_flow, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+)
+R_f = 1.0 / (h_f * 2.0 * np.pi * r_in)
+R_total_pipe = R_f + R_p
+# Optional sanity print
+A = np.pi * r_in**2
+v = m_flow / (rho_f * A)
+Re = rho_f * v * (2*r_in) / mu_f
+print(f"[Sanity] Re ≈ {Re:.0f} (turbulent expected >~ 4000); h_f ≈ {h_f:.0f} W/m²K")
+
+
+# =========================
+# Simulator for a given depth H
+# =========================
+def simulate_series(H):
+    """
+    Simulate one single-U bore of depth H (m) under UBWT with constant injection.
+    Returns (T_b, T_f_in, T_f_out, T_mean).
+    """
+    # Borehole & g-function
+    borehole = gt.boreholes.Borehole(H, D, r_b, x=0.0, y=0.0)
+    LoadAgg  = gt.load_aggregation.ClaessonJaved(dt, tmax)
+    time_req = LoadAgg.get_times_for_simulation()
+    gFunc    = gt.gfunction.gFunction(
+        borehole, alpha, time=time_req, boundary_condition='UBWT',
+        options=options, method=method
+    )
+    LoadAgg.initialize(gFunc.gFunc / (2.0 * np.pi * k_s))
+
+    # Single U-tube
+    tube = gt.pipes.SingleUTube(pos_single, r_in, r_out, borehole, k_s, k_g, R_total_pipe)
+
+    # March in time
+    T_b     = np.zeros(Nt)
+    T_f_in  = np.zeros(Nt)
+    T_f_out = np.zeros(Nt)
+    q_lin   = Q_reject_W / H  # W/m
+
+    for i, t in enumerate(time):
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(q_lin)
+        dT_b   = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT_b                       # injection → wall > T_g
+
+        # Pipe model coupling
+        T_f_in[i]  = tube.get_inlet_temperature(Q_reject_W, T_b[i], m_flow, cp_f)
+        T_f_out[i] = tube.get_outlet_temperature(T_f_in[i], T_b[i], m_flow, cp_f)
+
+    T_mean = 0.5 * (T_f_in + T_f_out)
+    return T_b, T_f_in, T_f_out, T_mean
+
+
+# =========================
+# Depth search: meet max(T_mean) <= 33°C
+# =========================
+def find_min_depth_by_mean(H_low=30.0, H_high=150.0, tol=0.5, max_iter=25):
+    """
+    Smallest H such that max(T_mean) <= T_mean_cap across the horizon.
+    """
+    def peak_mean(H):
+        _, _, _, Tm = simulate_series(H)
+        return float(np.max(Tm))
+
+    peak_low  = peak_mean(H_low)
+    peak_high = peak_mean(H_high)
+
+    if peak_low <= T_mean_cap:
+        # Already feasible at low bound: return low bound (or shrink range if desired)
+        T_b, T_f_in, T_f_out, T_mean = simulate_series(H_low)
+        return H_low, T_b, T_f_in, T_f_out, T_mean
+
+    if peak_high > T_mean_cap:
+        raise RuntimeError(
+            f"Mean-fluid cap {T_mean_cap} °C not met even at H_high={H_high} m "
+            f"(peak mean={peak_high:.2f} °C). Increase H_high or relax the cap."
+        )
+
+    lo, hi = H_low, H_high
+    best = None
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        peak_mid = peak_mean(mid)
+        if peak_mid <= T_mean_cap:
+            best = mid
+            hi = mid
+        else:
+            lo = mid
+        if (hi - lo) <= tol:
+            break
+
+    H_star = best if best is not None else hi
+    T_b, T_f_in, T_f_out, T_mean = simulate_series(H_star)
+    return H_star, T_b, T_f_in, T_f_out, T_mean
+
+
+# =========================
+# Run & plot
+# =========================
+if __name__ == "__main__":
+    H_star, T_b, T_f_in, T_f_out, T_mean = find_min_depth_by_mean(
+        H_low=30.0, H_high=150.0, tol=0.5
+    )
+
+    print(f"\nOptimal depth H* ≈ {H_star:.1f} m (cap: max mean fluid ≤ {T_mean_cap:.1f} °C)")
+    print(f"Peaks — T_b: {T_b.max():.2f} °C | T_f_in: {T_f_in.max():.2f} °C | "
+          f"T_f_out: {T_f_out.max():.2f} °C | T_mean: {T_mean.max():.2f} °C")
+
+    # One graph: inlet, outlet, wall, with 33 °C line
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+    ax.plot(hours, T_b,       label="Borehole wall")
+    ax.plot(hours, T_f_in,    label="Inlet (to bore)")
+    ax.plot(hours, T_f_out,   label="Outlet (to unit)")
+    #ax.plot(hours, T_mean,    label="Mean fluid (in/out avg)", linestyle='--')
+    ax.axhline(T_mean_cap, color='k', lw=1, ls=':', label='35 °C cap (mean)')
+    ax.set_xlabel("Time [h]"); ax.set_ylabel("Temperature [°C]")
+    ax.grid(True); ax.legend()
+    plt.tight_layout()
+    plt.show()
