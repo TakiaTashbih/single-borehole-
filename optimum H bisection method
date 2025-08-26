@@ -1,0 +1,121 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pygfunction as gt
+
+# ---------- Fixed design inputs (edit as needed) ----------
+# Geometry / ground
+D     = 4.0              # burial depth [m]
+r_b   = 0.1524/2         # borehole radius [m]
+alpha = 1.0e-6           # ground diffusivity [m2/s]
+k_s   = 2.45             # ground conductivity [W/m.K]
+T_g   = 25.0             # undisturbed ground temp [°C]
+
+# Pipe & grout
+r_out   = 0.032/2
+r_in    = 0.027/2
+D_s     = 0.05           # shank spacing [m]
+epsilon = 1e-6
+k_g     = 2.98
+k_p     = 0.42
+pos_single = [(-D_s, 0.0), (D_s, 0.0)]
+
+# Fluid & load
+m_flow = 0.30                                  # [kg/s]
+fluid  = gt.media.Fluid('Water', 20.0)         # or gt.media.Fluid('MPG20', 20.0)
+cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+Q_reject_W = -1000.0 * 3.517 *0.75           # 0.75 ton cooling → heat injected to ground (negative)
+
+# Simulation grid
+dt   = 3600.0                                   # 1 h
+tmax = 30 * 24 * 3600.0                         # 30 days
+Nt   = int(np.ceil(tmax/dt))
+time = dt * np.arange(1, Nt+1)
+options = {'nSegments': 8, 'disp': False}       # set True for verbose; add 'method':'similarities' if desired
+
+# Design cap
+T_cap = 35.50                                    # °C
+
+def simulate_peak_temperature(H):
+    """Return peak of max(T_b, T_f_out) over the horizon for a given depth H (m)."""
+    # Borehole and g-function (UBWT)
+    borehole = gt.boreholes.Borehole(H, D, r_b, x=0.0, y=0.0)
+    LoadAgg  = gt.load_aggregation.ClaessonJaved(dt, tmax)
+    time_req = LoadAgg.get_times_for_simulation()
+    gFunc    = gt.gfunction.gFunction(
+        borehole, alpha, time=time_req, boundary_condition='UBWT',
+        options=options
+    )
+    LoadAgg.initialize(gFunc.gFunc / (2.0 * np.pi * k_s))
+
+    # Pipe resistances
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f = 1.0 / (h_f * 2.0 * np.pi * r_in)
+
+    tube = gt.pipes.SingleUTube(pos_single, r_in, r_out, borehole, k_s, k_g, R_f + R_p)
+
+    # March in time
+    T_b = np.zeros(Nt)
+    T_f_in = np.zeros(Nt)
+    T_f_out = np.zeros(Nt)
+    for i, t in enumerate(time):
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(Q_reject_W / H)   # W/m
+        dT_b   = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT_b                        # injection raises wall above Tg
+        T_f_in[i]  = tube.get_inlet_temperature(Q_reject_W, T_b[i], m_flow, cp_f)
+        T_f_out[i] = tube.get_outlet_temperature(T_f_in[i], T_b[i], m_flow, cp_f)
+
+    peak = max(T_b.max(), T_f_out.max())
+    return peak, (T_b, T_f_in, T_f_out)
+
+def find_min_depth(H_low=30.0, H_high=150.0, tol=0.5, max_iter=50):
+    """
+    Bisection on H to meet max(T)<=T_cap.
+    Requires: not feasible at H_low, feasible at H_high (monotone).
+    """
+    peak_low, _  = simulate_peak_temperature(H_low)
+    peak_high, _ = simulate_peak_temperature(H_high)
+
+    if peak_low <= T_cap:
+        # Already feasible at the low bound — try to shrink further if you like
+        return H_low, simulate_peak_temperature(H_low)[1]
+    if peak_high > T_cap:
+        raise RuntimeError("Cap not met even at H_high. Increase H_high or relax design.")
+
+    lo, hi = H_low, H_high
+    best_H, best_series = None, None
+    for _ in range(max_iter):
+        mid = 0.5*(lo+hi)
+        peak_mid, series = simulate_peak_temperature(mid)
+        if peak_mid <= T_cap:
+            best_H, best_series = mid, series
+            hi = mid
+        else:
+            lo = mid
+        if (hi - lo) <= tol:
+            break
+    return best_H if best_H is not None else hi, best_series
+
+if __name__ == "__main__":
+    # 1) Run the optimiser
+    H_star, (T_b, T_f_in, T_f_out) = find_min_depth(H_low=30.0, H_high=150.0, tol=0.5)
+
+    # 2) Report & quick checks
+    print(f"Optimal depth H* ≈ {H_star:.1f} m")
+    print(f"Peak T_b = {T_b.max():.2f} °C, Peak T_f_out = {T_f_out.max():.2f} °C (cap = {T_cap:.2f} °C)")
+    assert max(T_b.max(), T_f_out.max()) <= T_cap + 1e-6, "Design does not meet the cap."
+
+    # 3) Plots at optimal depth
+    hours = time/3600.0
+    fig, ax = plt.subplots(2, 1, figsize=(10,8))
+    ax[0].plot(hours, np.full_like(hours, Q_reject_W)/1000.0)
+    ax[0].set_xlabel("Time [h]"); ax[0].set_ylabel("Ground heat rejection [kW]"); ax[0].grid(True)
+
+    ax[1].plot(hours, T_b, label="Borehole wall")
+    ax[1].plot(hours, T_f_out, '--', label="Outlet fluid")
+    ax[1].axhline(T_cap, color='k', lw=1, linestyle=':')
+    ax[1].set_xlabel("Time [h]"); ax[1].set_ylabel("Temperature [°C]"); ax[1].grid(True); ax[1].legend()
+    plt.tight_layout(); plt.show()
