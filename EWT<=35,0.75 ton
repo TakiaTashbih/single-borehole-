@@ -1,0 +1,171 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pygfunction as gt
+
+# =========================
+# Fixed design inputs
+# =========================
+# Ground / geometry
+D     = 4.0                # burial depth [m]
+r_b   = 0.2032/2 #0.1524/2           # borehole radius [m]
+alpha = 1.0e-6             # ground thermal diffusivity [m2/s]
+k_s   = 2.45               # ground thermal conductivity [W/m·K]
+T_g   = 25.0               # undisturbed ground temp [°C]
+
+# Pipe & grout
+r_out   = 0.032/2          # pipe outer radius [m]
+r_in    = 0.027/2          # pipe inner radius [m]
+D_s     = 0.08             # intended center-to-center shank spacing [m]
+epsilon = 1e-6             # pipe roughness [m]
+k_g     = 2.98             # grout conductivity [W/m·K]
+k_p     = 0.7             # pipe conductivity [W/m·K]
+# place legs at ±D_s/2 so center-to-center spacing is exactly D_s
+pos_single = [(-D_s, 0.0), (D_s, 0.0)]
+
+# Fluid & load (cooling → heat injected to ground; negative)
+m_flow = 0.25
+fluid  = gt.media.Fluid('Water', 20.0)          # or 'MPG20' for glycol mix
+cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+
+TON = 0.75
+Q_reject_W = -1000.0 * 3.517 * TON              # W (negative = injection)
+
+# Time grid (30 days, hourly)
+dt   = 3600.0
+tmax = 30 * 24 * 3600.0
+Nt   = int(np.ceil(tmax/dt))
+time = dt * np.arange(1, Nt+1)
+hours = time / 3600.0
+
+# g-function options (pygfunction ≥ 2.3)
+options = {'nSegments': 8, 'disp': False}
+method  = 'similarities'
+
+# -------- ASHRAE-style constraint --------
+# Kavanaugh & Rafferty (1997) imply a max EWT of ~85–90 °F (≈29–32 °C).
+EWT_cap_C   = 35.0          # choose 29.0 for more conservative sizing
+WALL_cap_C  = 40.0          # optional extra cap on borehole wall temp (set None to ignore)
+
+# =========================
+# Pipe-side terms (precompute)
+# =========================
+R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+    m_flow, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+)
+R_f = 1.0 / (h_f * 2.0 * np.pi * r_in)
+R_total_pipe = R_f + R_p
+
+# Reynolds sanity (reportable)
+A = np.pi * r_in**2
+v = m_flow / (rho_f * A)
+Re = rho_f * v * (2*r_in) / mu_f
+print(f" Re ≈ {Re:.0f} (turbulent expected >~ 4000); h_f ≈ {h_f:.0f} W/m²K")
+
+
+# =========================
+# Simulator for a given depth H
+# =========================
+def simulate_temperatures(H):
+    """Return (T_b, T_f_in, T_f_out) for a single U-tube bore of depth H under UBWT."""
+    borehole = gt.boreholes.Borehole(H, D, r_b, x=0.0, y=0.0)
+    LoadAgg  = gt.load_aggregation.ClaessonJaved(dt, tmax)
+    time_req = LoadAgg.get_times_for_simulation()
+    gFunc    = gt.gfunction.gFunction(
+        borehole, alpha, time=time_req, boundary_condition='UBWT',
+        options=options, method=method
+    )
+    LoadAgg.initialize(gFunc.gFunc / (2.0 * np.pi * k_s))
+
+    tube = gt.pipes.SingleUTube(pos_single, r_in, r_out, borehole, k_s, k_g, R_total_pipe)
+
+    T_b     = np.zeros(Nt)
+    T_f_in  = np.zeros(Nt)
+    T_f_out = np.zeros(Nt)
+
+    q_lin = Q_reject_W / H  # W/m
+    for i, t in enumerate(time):
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(q_lin)
+        dT_b   = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT_b                       # injection → wall > T_g
+        T_f_in[i]  = tube.get_inlet_temperature(Q_reject_W, T_b[i], m_flow, cp_f)
+        T_f_out[i] = tube.get_outlet_temperature(T_f_in[i], T_b[i], m_flow, cp_f)
+
+    return T_b, T_f_in, T_f_out
+
+
+# =========================
+# Depth search: meet ASHRAE EWT cap (and optional wall cap)
+# =========================
+def find_min_depth_by_EWT(H_low=30.0, H_high=150.0, tol=0.5, max_iter=25):
+    """
+    Smallest H such that:
+      max(EWT=T_f_out) <= EWT_cap_C
+      and (optional) max(T_b) <= WALL_cap_C
+    """
+    def violates_caps(H):
+        T_b, T_f_in, T_f_out = simulate_temperatures(H)
+        ewt_peak  = float(np.max(T_f_out))
+        wall_peak = float(np.max(T_b))
+        ok_ewt = ewt_peak <= EWT_cap_C + 1e-9
+        ok_wall = True if WALL_cap_C is None else (wall_peak <= WALL_cap_C + 1e-9)
+        return (not ok_ewt) or (not ok_wall), ewt_peak, wall_peak, (T_b, T_f_in, T_f_out)
+
+    bad_low, e_low, w_low, _ = violates_caps(H_low)
+    bad_high, e_high, w_high, _ = violates_caps(H_high)
+
+    if not bad_low:
+        # already satisfies caps at lower bound
+        T_b, T_f_in, T_f_out = simulate_temperatures(H_low)
+        return H_low, T_b, T_f_in, T_f_out
+
+    if bad_high:
+        raise RuntimeError(
+            f"Caps not met even at H_high={H_high} m "
+            f"(EWT_peak={e_high:.2f} °C, Wall_peak={w_high:.2f} °C). "
+            "Increase H_high or relax caps."
+        )
+
+    lo, hi = H_low, H_high
+    best_H, best_series = None, None
+    for _ in range(max_iter):
+        mid = 0.5*(lo+hi)
+        bad_mid, e_mid, w_mid, series = violates_caps(mid)
+        if bad_mid:
+            lo = mid
+        else:
+            best_H, best_series = mid, series
+            hi = mid
+        if (hi - lo) <= tol:
+            break
+
+    if best_H is None:
+        best_H, best_series = hi, violates_caps(hi)[3]
+    return best_H, *best_series
+
+
+# =========================
+# Run & plot
+# =========================
+if __name__ == "__main__":
+    H_star, T_b, T_f_in, T_f_out = find_min_depth_by_EWT(H_low=30.0, H_high=150.0, tol=0.5)
+
+    print(f"\nOptimal depth H* ≈ {H_star:.1f} m "
+          f"(EWT cap ≤ {EWT_cap_C:.1f} °C"
+          + (", mean fluid temperature  ≤ 40 °C")
+          + ")")
+    print(f"Peaks — EWT (T_f_out): {np.max(T_f_out):.2f} °C | "
+          f"LWT (T_f_in): {np.max(T_f_in):.2f} °C | "
+          f"T_b: {np.max(T_b):.2f} °C")
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+    ax.plot(hours, T_b,     label="Borehole wall T_b")
+    ax.plot(hours, T_f_in,  label="LWT to ground (T_f_in)")
+    ax.plot(hours, T_f_out, label="EWT to unit (T_f_out)")
+    ax.axhline(EWT_cap_C, color='k', lw=1, ls='--', label=f"EWT cap {EWT_cap_C:.0f} °C")
+    '''if WALL_cap_C is not None:
+        ax.axhline(WALL_cap_C, color='r', lw=1, ls=':', label=f"Wall cap {WALL_cap_C:.0f} °C")'''
+    ax.set_xlabel("Time [h]"); ax.set_ylabel("Temperature [°C]")
+    ax.grid(True); ax.legend()
+    plt.tight_layout(); plt.show()
