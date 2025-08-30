@@ -1,0 +1,188 @@
+# -*- coding: utf-8 -*-
+"""
+4.12***************** pygfunction >= 2.3.x
+Simulation of fluid temperatures in a single borehole
+Case: Single U-tube only : 0.75 ton 
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import pygfunction as gt
+import matplotlib as mpl
+mpl.rcParams.update({
+    "font.family": "serif", "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size": 12, "axes.titlesize": 12, "axes.labelsize": 12,
+    "xtick.labelsize": 12, "ytick.labelsize": 12, "legend.fontsize": 12,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "mathtext.fontset": "stix"
+})
+#plt.savefig('timeseries_0p75ton_singleU.tiff', dpi=300, bbox_inches='tight')
+
+def main():
+    # ---------------------------------------------------------------
+    # Simulation parameters
+    # ---------------------------------------------------------------
+    # Borehole dimensions
+    D   = 4.0       # burial depth [m]
+    H   = 55    # length [m]
+    r_b = 0.1524/2    # borehole radius [m]
+
+    # Pipe dimensions
+    r_out   = 0.032/2    # outer radius [m]
+    r_in    = 0.027/2    # inner radius [m]
+    D_s     = 0.06     # shank spacing [m]
+    epsilon = 1.0e-6    # roughness [m]
+
+    # Pipe positions (single U-tube: [(x_in, y_in), (x_out, y_out)])
+    pos_single = [(-D_s, 0.0), ( D_s, 0.0)]
+
+    # Ground
+    alpha = 1.0e-6    # thermal diffusivity [m2/s]
+    k_s   = 2.45       # thermal conductivity [W/m.K]
+    T_g   = 25      # undisturbed ground temperature [°C]
+
+    # Grout / pipe conductivity
+    k_g = 2.98         # grout [W/m.K]
+    k_p = 0.7       # pipe  [W/m.K]
+
+    # Fluid (20% water 20°C)
+    m_flow = 0.3                         # total mass flow rate [kg/s]
+    fluid  = gt.media.Fluid('Water', 30.0)
+    cp_f   = fluid.cp
+    rho_f  = fluid.rho
+    mu_f   = fluid.mu
+    k_f    = fluid.k
+
+    # g-Function options
+    options = {'nSegments': 8, 'disp': True}
+
+    # Time grid (1 year, hourly)
+    dt   = 3600.0          # 1 hr
+    tmax = 2*24 * 3600.0     # simulate 2 days
+    Nt   = int(np.ceil(tmax / dt))
+    time = dt * np.arange(1, Nt+1)
+    hours = time/3600
+
+    # ---------------------------------------------------------------
+    # Loads (Bernier synthetic profile)
+    # ---------------------------------------------------------------
+    #Q = synthetic_load(time / 3600.0)  # W (heat extraction rate)
+
+    # ---------------------------------------------------------------
+    # Load aggregation
+    # ---------------------------------------------------------------
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt, tmax)
+
+    # ---------------------------------------------------------------
+    # g-function (single borehole, UBWT boundary)
+    # ---------------------------------------------------------------
+    borehole = gt.boreholes.Borehole(H, D, r_b, x=0.0, y=0.0)
+    time_req = LoadAgg.get_times_for_simulation()
+    gFunc = gt.gfunction.gFunction(
+        borehole, alpha, time=time_req, boundary_condition='UBWT',
+        options=options, method='similarities'
+    )
+    LoadAgg.initialize(gFunc.gFunc / (2.0 * np.pi * k_s))
+
+    # ---------------------------------------------------------------
+    # Pipe model: Single U-tube
+    # ---------------------------------------------------------------
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f = 1.0 / (h_f * 2.0 * np.pi * r_in)
+
+    SingleUTube = gt.pipes.SingleUTube(
+        pos_single, r_in, r_out, borehole, k_s, k_g, R_f + R_p
+    )
+    Q_reject_W = -1000.0*3.517*0.75  # W (-ve = heat injected into ground)
+    Q_tot = np.full(Nt, Q_reject_W)
+
+    # ---------------------------------------------------------------
+    # Simulation loop
+    # ---------------------------------------------------------------
+    T_b            = np.zeros(Nt)    # borehole wall temperature
+    T_f_in_single  = np.zeros(Nt)
+    T_f_out_single = np.zeros(Nt)
+
+    for i, (t, Q) in enumerate(zip(time, Q_tot)):
+        # advance time and set current linear load (W/m)
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(Q / H)
+
+        # wall temperature
+        dT_b = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT_b
+
+        # inlet and outlet fluid temps
+        T_f_in_single[i] = SingleUTube.get_inlet_temperature(
+            Q_tot[i], T_b[i], m_flow, cp_f
+        )
+        T_f_out_single[i] = SingleUTube.get_outlet_temperature(
+            T_f_in_single[i], T_b[i], m_flow, cp_f
+        )
+
+    # ---------------------------------------------------------------
+    # Plot results
+    # ---------------------------------------------------------------
+    hours = np.arange(1, Nt + 1) * dt / 3600.0
+    fig = gt.utilities._initialize_figure()
+
+    ax1 = fig.add_subplot(211)
+    ax1.set_xlabel(r'Time [hours]')
+    ax1.set_ylabel(r'Heat rejection rate [W]')
+    gt.utilities._format_axes(ax1)
+    ax1.plot(hours, Q_tot)
+    ax2 = fig.add_subplot(212)
+    ax2.set_xlabel(r'Time [hours]')
+    ax2.set_ylabel(r'Temperature [°C]')
+    gt.utilities._format_axes(ax2)
+    ax2.plot(hours, T_b, 'k-', lw=1.5, label='Borehole wall')
+    ax2.plot(hours, T_f_in_single, '--', label='Intlet, single U-tube')
+    ax2.plot(hours, T_f_out_single, '--', label='Outlet, single U-tube')
+    ax2.legend()
+    plt.tight_layout()
+    plt.savefig('ground_heat_rejection_and_temperatures 55 m 0. .tiff', format='tiff')
+
+    # ---------------------------------------------------------------
+    # Depth profile at ~1 year
+    # ---------------------------------------------------------------
+    nz = 20
+    it = min(8724, Nt - 1)
+    z = np.linspace(0.0, H, num=nz)
+
+    T_f_single = SingleUTube.get_temperature(z, T_f_in_single[it], T_b[it], m_flow, cp_f)
+
+    fig = gt.utilities._initialize_figure()
+    ax3 = fig.add_subplot(111)
+    ax3.set_xlabel(r'Temperature [°C]')
+    ax3.set_ylabel(r'Depth from borehole head [m]')
+    gt.utilities._format_axes(ax3)
+    ax3.plot([T_b[it], T_b[it]], [0.0, H], 'k--')
+    #ax3.plot(T_f_single, z, color='b', marker='o', label='Down pipe ', markersize=5)
+    ax3.plot(T_f_single, z, color='k', marker='^', label='Up pipe ', markersize=5)    
+    #ax3.plot(T_f_single, z, 'b-', label='Fluid')
+    ax3.legend(['Borehole wall','Up pipe', 'Down pipe'])
+    ax3.set_ylim(ax3.get_ylim()[::-1])  # depth downward
+    plt.tight_layout()
+    plt.savefig('depth_profile  m 2_2.tiff', format='tiff')
+    
+    # Optional: CSV export (uncomment to save)
+    # -------------------------
+    import pandas as pd
+    df = pd.DataFrame({
+        'hour': hours,
+       'Q_tot_W': Q_tot,
+       'T_b_degC': T_b,
+        'T_f_in_degC': T_f_in_single,
+     'T_f_out_degC': T_f_out_single
+     })
+    df.to_csv('bd_p75ton_single_bores_singleU_timeseries.csv', index=False)
+    print('Saved: bd_p75ton_single_bores_singleU_timeseries.csv')
+
+
+
+
+if __name__ == "__main__":
+    main() 
+
